@@ -8,70 +8,48 @@ except ImportError:
     # Allow running without Nous for structure testing
     NousModel = None
 
-class StateSpaceExpert(nn.Module):
+class FourierExpert(nn.Module):
     """
-    A Linear Recurrent Unit (LRU) for structural sequence modeling.
-    Provides context awareness ($O(L)$ complexity) to the Structural Lobe.
+    A Fourier Neural Operator (FNO) Expert for global token mixing.
+    Uses FFT to provide $O(L \\log L)$ global interaction without the numerical 
+    instability of SSM recurrence or the $O(L^2)$ cost of Attention.
     """
-    def __init__(self, d_model):
+    def __init__(self, d_model, max_len=1024):
         super().__init__()
         self.d_model = d_model
-        # Recurrence coefficient (Lambda). Diagonal for efficiency.
-        # Initialized to allow long-range memory (near 1.0).
-        self.log_lambda = nn.Parameter(torch.log(torch.ones(d_model) * 0.9))
+        self.max_len = max_len
         
-        # Input/Output projections
+        # Learnable filter in the frequency domain
+        # We use RFFT, so we need max_len // 2 + 1 complex weights
+        self.weight = nn.Parameter(torch.view_as_complex(torch.randn(max_len // 2 + 1, d_model, 2) * 0.02))
+        
         self.in_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
         
     def forward(self, x, state=None):
         """
         x: [Batch, Seq, Dim]
-        state: [Batch, Dim] (Optional, for step-by-step inference)
-        Returns: (output, next_state)
         """
         u = self.in_proj(x)
         B, L, D = u.shape
         
-        if L > 1 and state is None:
-            # Training/Batch mode (Vectorized Parallel Scan)
-            # Formula: h_t = lambda * h_{t-1} + u_t
-            # Vectorized: h_t = lambda^t * cumsum(u_t / lambda^t)
-            
-            # Use float32 for accumulation stability
-            u_f32 = u.to(torch.float32)
-            log_lamb_f32 = self.log_lambda.to(torch.float32)
-            
-            # exponents: [0, 1, ..., L-1]
-            exponents = torch.arange(L, device=u.device, dtype=torch.float32)
-            
-            # log_powers: [L, D]
-            log_powers = exponents.unsqueeze(1) * log_lamb_f32.unsqueeze(0)
-            
-            # Apply scaling: u_t * exp(-t * log_lambda)
-            # We unsqueeze for batch dimension
-            u_scaled = u_f32 * torch.exp(-log_powers).unsqueeze(0)
-            
-            # Parallel Cumulative Sum
-            h_f32 = torch.cumsum(u_scaled, dim=1)
-            
-            # Re-apply decay: h_t * exp(t * log_lambda)
-            h_f32 = h_f32 * torch.exp(log_powers).unsqueeze(0)
-            
-            h = h_f32.to(u.dtype)
-            next_state = h[:, -1, :]
-        else:
-            # Step-by-step inference mode
-            lamb = torch.exp(self.log_lambda)
-            # x is [B, 1, D] or [B, D]
-            prev_h = state if state is not None else torch.zeros(B, D, device=u.device, dtype=u.dtype)
-            
-            # Use only the first token if a sequence is passed in inference mode
-            u_step = u[:, 0, :] if L > 1 else u.squeeze(1)
-            next_state = lamb * prev_h + u_step
-            h = next_state.unsqueeze(1) # shape [B, 1, D]
-            
-        return self.out_proj(h), next_state
+        # --- Fourier Mixing ---
+        # 1. To Frequency Domain
+        x_freq = torch.fft.rfft(u, n=L, dim=1, norm="ortho")
+        
+        # 2. Apply Learnable Filter
+        # We slice or interpolate the weights based on current L
+        # For simplicity and training stability, we slice the fixed-size weights
+        w_slice = self.weight[:x_freq.shape[1], :]
+        x_freq = x_freq * w_slice
+        
+        # 3. Back to Time Domain
+        out = torch.fft.irfft(x_freq, n=L, dim=1, norm="ortho")
+        
+        # 4. Out Projection + Jump-connection style Norm
+        out = self.out_proj(out)
+        return self.norm(out), None # Stateless for now
 
 class StructuralLobe(nn.Module):
     """
@@ -105,11 +83,11 @@ class StructuralLobe(nn.Module):
         
         # --- 4. Dense Experts ---
         
-        # A. Syntactic Expert (State Space)
-        self.syntax_expert = StateSpaceExpert(tpr_dim)
+        # A. Syntactic Expert (Fourier Global)
+        self.syntax_expert = FourierExpert(tpr_dim)
         
-        # B. Logical Expert (State Space)
-        self.logic_expert = StateSpaceExpert(tpr_dim)
+        # B. Logical Expert (Fourier Global)
+        self.logic_expert = FourierExpert(tpr_dim)
         
         # C. Formal Expert (Nous Branch)
         self.to_formal = nn.Linear(tpr_dim, 3) 
@@ -133,14 +111,14 @@ class StructuralLobe(nn.Module):
         # 2. Compute Expert Relevance (Sigmoid for independent activation)
         relevance = torch.sigmoid(self.expert_gating(expert_input))
         
-        # 3. Run Dense Experts (Stateful SSMs)
-        state = state or {}
+        # 3. Run Dense Experts (Fourier Mixers)
+        # Note: Fourier Experts are global and currently stateless
         
         # Expert 1: Syntax
-        out_syntax, next_state_syntax = self.syntax_expert(expert_input, state.get("syntax"))
+        out_syntax, _ = self.syntax_expert(expert_input)
         
         # Expert 2: Logic
-        out_logic, next_state_logic = self.logic_expert(expert_input, state.get("logic"))
+        out_logic, _ = self.logic_expert(expert_input)
         
         # Expert 3: Formal (Nous Model - currently stateless)
         if self.nous:
@@ -164,9 +142,4 @@ class StructuralLobe(nn.Module):
         # 5. Return to Residual Stream
         output = self.adapter_out(integrated_signal)
         
-        next_state = {
-            "syntax": next_state_syntax,
-            "logic": next_state_logic
-        }
-        
-        return output, next_state
+        return output, {}

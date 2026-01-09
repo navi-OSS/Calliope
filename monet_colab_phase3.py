@@ -1,4 +1,4 @@
-# Monet V4.0 Phase 3: Logic Grounding (Colab Edition)
+# Monet V4.0 Phase 3: Logic Grounding (Colab Edition - FOURIER PIVOT)
 # Run this script in Google Colab on a T4 GPU.
 
 import os
@@ -11,97 +11,67 @@ from datasets import load_dataset
 import sys
 
 # --- 1. Environment & Path Setup ---
-# Assumes 'Calliope' or 'monet' repo is cloned in /content/
+base_model_path = "./pruned_gemma_3_270m"
 if not os.path.exists("./monet"):
     print("⚠️ 'monet' directory not found. Cloning repository...")
     os.system("git clone https://github.com/navi-OSS/Calliope.git temp_repo")
-    # Use cp -r to correctly merge directory contents instead of mv
     os.system("cp -rv temp_repo/* .")
     os.system("rm -rf temp_repo")
 
-# Install missing deps if needed
+# Install missing deps
 try:
     import einops
 except ImportError:
     os.system("pip install einops accelerate datasets")
 
 from monet.graft import MonetModel
-from monet.tpr import StructuralLobe, StateSpaceExpert
+from monet.tpr import StructuralLobe
 from monet.tokenizer import PrunedTokenizer
 
-# --- 2. CRITICAL PATCH: Vectorized State Space Expert ---
-# We monkey-patch the class to ensure OOM-free vectorized execution
-# This replaces the Python loop with a Parallel Scan (cumsum)
+# --- 2. ARCHITECTURE PATCH: Fourier Neural Expert ---
+# Since we pivoted from SSM to Fourier for stability (Zero loss=nan)
 
-def vectorized_forward(self, x, state=None):
-    """
-    Vectorized Forward Pass for Linear Recurrent Unit.
-    x: [Batch, Seq, Dim]
-    """
-    u = self.in_proj(x)
-    B, L, D = u.shape
-    
-    if L > 1 and state is None:
-        # Training/Batch mode (Vectorized Parallel Scan)
-        # Formula: h_t = lambda * h_{t-1} + u_t
-        # Vectorized: h_t = lambda^t * cumsum(u_t / lambda^t)
+class FourierExpert(nn.Module):
+    def __init__(self, d_model, max_len=1024):
+        super().__init__()
+        self.d_model = d_model
+        self.max_len = max_len
+        self.weight = nn.Parameter(torch.view_as_complex(torch.randn(max_len // 2 + 1, d_model, 2) * 0.02))
+        self.in_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm = nn.LayerNorm(d_model)
         
-        # Use float32 for accumulation stability
-        u_f32 = u.to(torch.float32)
-        log_lamb_f32 = self.log_lambda.to(torch.float32)
-        
-        # exponents: [0, 1, ..., L-1]
-        exponents = torch.arange(L, device=u.device, dtype=torch.float32)
-        
-        # log_powers: [L, D]
-        log_powers = exponents.unsqueeze(1) * log_lamb_f32.unsqueeze(0)
-        
-        # Apply scaling: u_t * exp(-t * log_lambda)
-        # We unsqueeze for batch dimension
-        u_scaled = u_f32 * torch.exp(-log_powers).unsqueeze(0)
-        
-        # Parallel Cumulative Sum
-        h_f32 = torch.cumsum(u_scaled, dim=1)
-        
-        # Re-apply decay: h_t * exp(t * log_lambda)
-        h_f32 = h_f32 * torch.exp(log_powers).unsqueeze(0)
-        
-        h = h_f32.to(u.dtype)
-        next_state = h[:, -1, :]
-    else:
-        # Step-by-step inference mode (Legacy)
-        lamb = torch.exp(self.log_lambda)
-        # x is [B, 1, D] or [B, D]
-        prev_h = state if state is not None else torch.zeros(B, D, device=u.device, dtype=u.dtype)
-        
-        u_step = u[:, 0, :] if L > 1 else u.squeeze(1)
-        next_state = lamb * prev_h + u_step
-        h = next_state.unsqueeze(1) # shape [B, 1, D]
-        
-    return self.out_proj(h), next_state
+    def forward(self, x, state=None):
+        u = self.in_proj(x)
+        B, L, D = u.shape
+        x_freq = torch.fft.rfft(u, n=L, dim=1, norm="ortho")
+        w_slice = self.weight[:x_freq.shape[1], :]
+        x_freq = x_freq * w_slice
+        out = torch.fft.irfft(x_freq, n=L, dim=1, norm="ortho")
+        out = self.out_proj(out)
+        return self.norm(out), None
 
-# Apply Patch
-print("💉 Applying Vectorized SSM Patch to StateSpaceExpert...")
-StateSpaceExpert.forward = vectorized_forward
+# Patching the Lobe to use Fourier instead of SSM
+from monet import tpr
+tpr.FourierExpert = FourierExpert
+print("💉 Fourier Global Expert Patched.")
 
 # --- 3. Training Script ---
 
 def train_colab():
     # Setup
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"🚀 Starting Colab GSM8K Finetune on {device}")
+    print(f"🚀 Starting Colab GSM8K Finetune (FOURIER) on {device}")
     
-    # Config for T4 GPU (16GB VRAM)
-    # Vectorized SSM is very memory efficient, so we can push BS
+    # Config
     batch_size = 16 
     grad_accum_steps = 4
     max_length = 512
     
-    # Load Models
-    # Assumes weights are uploaded to /content/
-    base_model_path = "./pruned_gemma_3_270m"
+    # Ensure folders exist
     os.makedirs(base_model_path, exist_ok=True)
-
+    
+    # Check weights
     weights_missing = not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
                           os.path.exists(os.path.join(base_model_path, "pytorch_model.bin")))
                           
@@ -111,50 +81,35 @@ def train_colab():
         try:
             snapshot_download(repo_id="thiliimanya/pruned_gemma_3_270m", local_dir=base_model_path)
         except Exception as e:
-            print(f"\n⚠️ HuggingFace download failed. checking if you uploaded manually...")
+            print(f"⚠️ HuggingFace download failed. Checking manual uploads...")
 
     # --- Auto-Rescue: Check root directory for weights ---
-    # Users often upload to /content/ instead of the folder.
     if os.path.exists("model.safetensors"):
-        print("📦 Found 'model.safetensors' in root. Moving to model folder...")
+        print("📦 Found 'model.safetensors' in root. Moving to folder...")
         import shutil
         shutil.move("model.safetensors", os.path.join(base_model_path, "model.safetensors"))
 
     # --- Auto-Rescue: Tokenizer Indices ---
     indices_file = "keep_indices.pt"
     indices_target = os.path.join(base_model_path, indices_file)
-    
     if not os.path.exists(indices_target):
         if os.path.exists(indices_file):
-            print(f"📦 Found '{indices_file}' in root. Moving to model folder...")
+            print(f"📦 Found '{indices_file}' in root. Moving...")
             import shutil
             shutil.move(indices_file, indices_target)
         else:
-            print(f"🌐 '{indices_file}' not found. Attempting direct download from GitHub...")
-            raw_url = f"https://raw.githubusercontent.com/navi-OSS/Calliope/master/{base_model_path.strip('./')}/{indices_file}"
+            print(f"🌐 '{indices_file}' missing. Downloading from GitHub...")
+            raw_url = f"https://raw.githubusercontent.com/navi-OSS/Calliope/master/pruned_gemma_3_270m/{indices_file}"
             os.system(f"curl -L {raw_url} -o {indices_target}")
-    
-    # Final Verification
-    if not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
-            os.path.exists(os.path.join(base_model_path, "pytorch_model.bin"))):
-        print(f"❌ Error: Weights still missing in {base_model_path}.")
-        print("   -> Action: Upload 'model.safetensors' into the model folder.")
-        sys.exit(1)
-        
-    if not os.path.exists(indices_target):
-        print(f"❌ Error: '{indices_file}' still missing.")
-        print(f"   Current Directory Contents: {os.listdir('.')}")
-        if os.path.exists(base_model_path):
-             print(f"   Target Directory Contents: {os.listdir(base_model_path)}")
-        sys.exit(1)
 
+    # Load Models
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16)
     tokenizer = PrunedTokenizer(base_model_path)
     
     hidden_size = base_model.config.hidden_size
     num_layers = len(base_model.model.layers)
     
-    # Reconstruct V4.0 Lobe Structure
+    # Reconstruct V4.0 Lobe Structure (using Fourier Expert via Patch)
     lobes = nn.ModuleList([
         StructuralLobe(d_model=hidden_size, tpr_dim=hidden_size).to(torch.float16) 
         for _ in range(num_layers)
@@ -184,14 +139,15 @@ def train_colab():
             new_key = k.replace("_orig_mod.", "")
             clean_state_dict[new_key] = v
         
+        # Strict=False because we swapped SSM for Fourier (param names will mismatch)
         model.load_state_dict(clean_state_dict, strict=False)
-    else:
-        print("⚠️ Warning: 'monet_v4_aligned.pt' not found. Starting from scratch (not recommended).")
     
     # Data
     print("🌊 Loading GSM8K...")
     dataset = load_dataset("openai/gsm8k", "main", split="train")
     samples = [f"Question: {item['question']}\n\nAnswer: {item['answer']}" for item in dataset]
+    import random
+    random.shuffle(samples)
     
     model.train()
     pbar = tqdm.tqdm(total=len(samples))
@@ -200,7 +156,7 @@ def train_colab():
     running_loss = 0.0
     optimizer.zero_grad()
     
-    print("🏁 Starting Training...")
+    print("🏁 Starting Fourier Grounding...")
     for batch_idx, text in enumerate(samples):
         try:
             inputs = tokenizer([text], return_tensors="pt", padding=True, truncation=True, max_length=max_length).to(device)
@@ -213,10 +169,10 @@ def train_colab():
                 shift_logits = logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
                 loss = ce_loss(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                logit_scale = loss / grad_accum_steps
+                loss = loss / grad_accum_steps
             
-            logit_scale.backward()
-            running_loss += logit_scale.item() * grad_accum_steps
+            loss.backward()
+            running_loss += loss.item() * grad_accum_steps
             
             if (batch_idx + 1) % grad_accum_steps == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -228,14 +184,14 @@ def train_colab():
             pbar.update(1)
             
             if batch_idx > 0 and batch_idx % 500 == 0:
-                torch.save(model.state_dict(), "monet_v4_logic_colab_latest.pt")
+                torch.save(model.state_dict(), "monet_v4_logic_fourier_latest.pt")
                 
         except Exception as e:
             print(f"⚠️ Error: {e}")
             continue
 
     print("✅ Finished.")
-    torch.save(model.state_dict(), "monet_v4_logic_final.pt")
+    torch.save(model.state_dict(), "monet_v4_logic_fourier_final.pt")
 
 if __name__ == "__main__":
     train_colab()
