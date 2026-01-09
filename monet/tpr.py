@@ -20,8 +20,8 @@ class FourierExpert(nn.Module):
         self.max_len = max_len
         
         # Learnable filter in the frequency domain
-        # We use RFFT, so we need max_len // 2 + 1 complex weights
-        self.weight = nn.Parameter(torch.view_as_complex(torch.randn(max_len // 2 + 1, d_model, 2) * 0.02))
+        # Initialization: 0.001 to ensure System 2 starts with infinitesimal influence.
+        self.weight = nn.Parameter(torch.view_as_complex(torch.randn(max_len // 2 + 1, d_model, 2) * 0.001))
         
         self.in_proj = nn.Linear(d_model, d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -35,21 +35,26 @@ class FourierExpert(nn.Module):
         B, L, D = u.shape
         
         # --- Fourier Mixing ---
-        # 1. To Frequency Domain
-        x_freq = torch.fft.rfft(u, n=L, dim=1, norm="ortho")
+        # 1. To Frequency Domain (Force float32 for FFT stability)
+        u_f32 = u.to(torch.float32)
+        x_freq = torch.fft.rfft(u_f32, n=L, dim=1, norm="ortho")
         
         # 2. Apply Learnable Filter
-        # We slice or interpolate the weights based on current L
-        # For simplicity and training stability, we slice the fixed-size weights
-        w_slice = self.weight[:x_freq.shape[1], :]
+        w_slice = self.weight[:x_freq.shape[1], :].to(torch.complex64)
         x_freq = x_freq * w_slice
         
         # 3. Back to Time Domain
-        out = torch.fft.irfft(x_freq, n=L, dim=1, norm="ortho")
+        out_f32 = torch.fft.irfft(x_freq, n=L, dim=1, norm="ortho")
+        out = out_f32.to(u.dtype)
         
         # 4. Out Projection + Jump-connection style Norm
         out = self.out_proj(out)
-        return self.norm(out), None # Stateless for now
+        
+        # 5. Stabilization Clamp
+        # Prevent Fourier outliers from exploding the residual stream
+        out = torch.clamp(out, -100, 100)
+        
+        return self.norm(out), None
 
 class StructuralLobe(nn.Module):
     """
@@ -78,8 +83,11 @@ class StructuralLobe(nn.Module):
         self.roles = nn.Parameter(torch.randn(num_roles, tpr_dim))
         
         # --- 3. Expert Gating ---
-        # 3. Gating Mechanism (Learned Router)
+        # Gating Mechanism (Learned Router)
+        # Cold-Start Init: Initialize bias to -10.0 so System 2 starts INACTIVE.
         self.expert_gating = nn.Linear(tpr_dim, 3) # [Syntax, Logic, Formal]
+        with torch.no_grad():
+            self.expert_gating.bias.fill_(-10.0)
         
         # --- 4. Dense Experts ---
         
