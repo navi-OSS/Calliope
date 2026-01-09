@@ -99,10 +99,17 @@ def train_colab():
     # Load Models
     # Assumes weights are uploaded to /content/
     base_model_path = "./pruned_gemma_3_270m"
-    if not os.path.exists(base_model_path):
+    weights_missing = not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
+                          os.path.exists(os.path.join(base_model_path, "pytorch_model.bin")))
+                          
+    if weights_missing:
         print("📥 Downloading Pruned Gemma Base...")
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id="thiliimanya/pruned_gemma_3_270m", local_dir=base_model_path)
+        try:
+            snapshot_download(repo_id="thiliimanya/pruned_gemma_3_270m", local_dir=base_model_path)
+        except Exception as e:
+            print(f"⚠️ Failed to download from HuggingFace: {e}")
+            print("Please upload 'model.safetensors' to ./pruned_gemma_3_270m/ manually if the repo assumes it exists.")
 
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16)
     tokenizer = PrunedTokenizer(base_model_path)
