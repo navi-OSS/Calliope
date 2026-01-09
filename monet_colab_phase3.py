@@ -125,6 +125,11 @@ def train_colab():
         print("📦 Found 'model.safetensors' in root. Moving to model folder...")
         import shutil
         shutil.move("model.safetensors", os.path.join(base_model_path, "model.safetensors"))
+
+    if os.path.exists("keep_indices.pt"):
+        print("📦 Found 'keep_indices.pt' in root. Moving to model folder...")
+        import shutil
+        shutil.move("keep_indices.pt", os.path.join(base_model_path, "keep_indices.pt"))
     
     # Double check before loading to prevent ugly Traceback
     if not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
@@ -133,6 +138,12 @@ def train_colab():
         print(f"   Current Directory Contents: {os.listdir('.')}")
         if os.path.exists(base_model_path):
              print(f"   Target Directory Contents: {os.listdir(base_model_path)}")
+        sys.exit(1)
+        
+    if not os.path.exists(os.path.join(base_model_path, "keep_indices.pt")):
+        print(f"❌ Error: 'keep_indices.pt' missing in {base_model_path}.")
+        print("   This list of token indices is required for the Pruned Tokenizer.")
+        print("   -> Action: Force push the updated repo OR drag-and-drop 'keep_indices.pt' into the model folder.")
         sys.exit(1)
 
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16)
