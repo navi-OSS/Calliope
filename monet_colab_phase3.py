@@ -119,10 +119,20 @@ def train_colab():
             print("   4. Re-run this cell.")
             sys.exit(1)
 
+    # --- Auto-Rescue: Check root directory for weights ---
+    # Users often upload to /content/ instead of the folder.
+    if os.path.exists("model.safetensors"):
+        print("📦 Found 'model.safetensors' in root. Moving to model folder...")
+        import shutil
+        shutil.move("model.safetensors", os.path.join(base_model_path, "model.safetensors"))
+    
     # Double check before loading to prevent ugly Traceback
     if not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
             os.path.exists(os.path.join(base_model_path, "pytorch_model.bin"))):
-        print("❌ Error: Directory exists but weights are still missing. Did you upload them?")
+        print(f"❌ Error: Weights still missing in {base_model_path}.")
+        print(f"   Current Directory Contents: {os.listdir('.')}")
+        if os.path.exists(base_model_path):
+             print(f"   Target Directory Contents: {os.listdir(base_model_path)}")
         sys.exit(1)
 
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16)
