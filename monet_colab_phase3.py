@@ -15,7 +15,8 @@ import sys
 if not os.path.exists("./monet"):
     print("⚠️ 'monet' directory not found. Cloning repository...")
     os.system("git clone https://github.com/navi-OSS/Calliope.git temp_repo")
-    os.system("mv temp_repo/* .")
+    # Use cp -r to correctly merge directory contents instead of mv
+    os.system("cp -rv temp_repo/* .")
     os.system("rm -rf temp_repo")
 
 # Install missing deps if needed
@@ -99,6 +100,8 @@ def train_colab():
     # Load Models
     # Assumes weights are uploaded to /content/
     base_model_path = "./pruned_gemma_3_270m"
+    os.makedirs(base_model_path, exist_ok=True)
+
     weights_missing = not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
                           os.path.exists(os.path.join(base_model_path, "pytorch_model.bin")))
                           
@@ -108,16 +111,7 @@ def train_colab():
         try:
             snapshot_download(repo_id="thiliimanya/pruned_gemma_3_270m", local_dir=base_model_path)
         except Exception as e:
-            print(f"\n❌ CRITICAL ERROR: Could not download model weights.")
-            print(f"   Reason: {e}")
-            print("\n👉 ACTION REQUIRED:")
-            print("   The script cannot find the base model weights ('model.safetensors').")
-            print("   Since the repository 'thiliimanya/pruned_gemma_3_270m' might not be public/exist:")
-            print("   1. Open the file browser on the left.")
-            print("   2. Navigate to 'pruned_gemma_3_270m' folder.")
-            print("   3. Drag and Drop your LOCAL 'model.safetensors' (511MB) into that folder.")
-            print("   4. Re-run this cell.")
-            sys.exit(1)
+            print(f"\n⚠️ HuggingFace download failed. checking if you uploaded manually...")
 
     # --- Auto-Rescue: Check root directory for weights ---
     # Users often upload to /content/ instead of the folder.
@@ -126,24 +120,32 @@ def train_colab():
         import shutil
         shutil.move("model.safetensors", os.path.join(base_model_path, "model.safetensors"))
 
-    if os.path.exists("keep_indices.pt"):
-        print("📦 Found 'keep_indices.pt' in root. Moving to model folder...")
-        import shutil
-        shutil.move("keep_indices.pt", os.path.join(base_model_path, "keep_indices.pt"))
+    # --- Auto-Rescue: Tokenizer Indices ---
+    indices_file = "keep_indices.pt"
+    indices_target = os.path.join(base_model_path, indices_file)
     
-    # Double check before loading to prevent ugly Traceback
+    if not os.path.exists(indices_target):
+        if os.path.exists(indices_file):
+            print(f"📦 Found '{indices_file}' in root. Moving to model folder...")
+            import shutil
+            shutil.move(indices_file, indices_target)
+        else:
+            print(f"🌐 '{indices_file}' not found. Attempting direct download from GitHub...")
+            raw_url = f"https://raw.githubusercontent.com/navi-OSS/Calliope/master/{base_model_path.strip('./')}/{indices_file}"
+            os.system(f"curl -L {raw_url} -o {indices_target}")
+    
+    # Final Verification
     if not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
             os.path.exists(os.path.join(base_model_path, "pytorch_model.bin"))):
         print(f"❌ Error: Weights still missing in {base_model_path}.")
+        print("   -> Action: Upload 'model.safetensors' into the model folder.")
+        sys.exit(1)
+        
+    if not os.path.exists(indices_target):
+        print(f"❌ Error: '{indices_file}' still missing.")
         print(f"   Current Directory Contents: {os.listdir('.')}")
         if os.path.exists(base_model_path):
              print(f"   Target Directory Contents: {os.listdir(base_model_path)}")
-        sys.exit(1)
-        
-    if not os.path.exists(os.path.join(base_model_path, "keep_indices.pt")):
-        print(f"❌ Error: 'keep_indices.pt' missing in {base_model_path}.")
-        print("   This list of token indices is required for the Pruned Tokenizer.")
-        print("   -> Action: Force push the updated repo OR drag-and-drop 'keep_indices.pt' into the model folder.")
         sys.exit(1)
 
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16)
