@@ -14,7 +14,7 @@ import sys
 # Assumes 'Calliope' or 'monet' repo is cloned in /content/
 if not os.path.exists("./monet"):
     print("⚠️ 'monet' directory not found. Cloning repository...")
-    os.system("git clone https://github.com/thiliimanya/Calliope.git temp_repo")
+    os.system("git clone https://github.com/navi-OSS/Calliope.git temp_repo")
     os.system("mv temp_repo/* .")
     os.system("rm -rf temp_repo")
 
