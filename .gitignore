@@ -1,4 +1,32 @@
+# Professional .gitignore
+# Created for Monet V4.0 Project
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Large Model weights
 *.pt
-__pycache__
-.venv
 *.safetensors
+*.ckpt
+*.bin
+archives/checkpoints/
+
+# Metadata & OS files
+.DS_Store
+.ipynb_checkpoints/
+
+# Data directories
+data/
+pruned_gemma_3_270m/
+pruned_gemma_3_270m_it/
+
+# Exclude tokenizer index from general .pt ignore
+!keep_indices.pt
+!pruned_gemma_3_270m/keep_indices.pt

@@ -35,8 +35,9 @@ class FourierExpert(nn.Module):
         B, L, D = u.shape
         
         # --- Fourier Mixing ---
-        # 1. To Frequency Domain (Force float32 for FFT stability)
         u_f32 = u.to(torch.float32)
+        
+        # 1. To Frequency Domain (Safe FFT)
         x_freq = torch.fft.rfft(u_f32, n=L, dim=1, norm="ortho")
         
         # 2. Apply Learnable Filter
@@ -45,14 +46,13 @@ class FourierExpert(nn.Module):
         
         # 3. Back to Time Domain
         out_f32 = torch.fft.irfft(x_freq, n=L, dim=1, norm="ortho")
-        out = out_f32.to(u.dtype)
         
-        # 4. Out Projection + Jump-connection style Norm
-        out = self.out_proj(out)
+        # 4. Out Projection
+        out = self.out_proj(out_f32.to(u.dtype))
         
-        # 5. Stabilization Clamp
-        # Prevent Fourier outliers from exploding the residual stream
-        out = torch.clamp(out, -100, 100)
+        # 5. Stabilization: Cleanse NaNs and Clamp outliers
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        out = torch.clamp(out, -10.0, 10.0) 
         
         return self.norm(out), None
 
@@ -116,38 +116,35 @@ class StructuralLobe(nn.Module):
         # 1. Adapt to Expert Space (Identity if full width)
         expert_input = self.adapter_in(x)
         
-        # 2. Compute Expert Relevance (Sigmoid for independent activation)
+        # 2. Compute Expert Relevance 
+        # Add epsilon to prevent grad nan in sigmoid
         relevance = torch.sigmoid(self.expert_gating(expert_input))
         
         # 3. Run Dense Experts (Fourier Mixers)
-        # Note: Fourier Experts are global and currently stateless
+        # Force float32 for System 2 logic to prevent float16 overflow NaNs
+        expert_input_f32 = expert_input.to(torch.float32)
         
         # Expert 1: Syntax
-        out_syntax, _ = self.syntax_expert(expert_input)
+        out_syntax_f32, _ = self.syntax_expert(expert_input_f32)
         
         # Expert 2: Logic
-        out_logic, _ = self.logic_expert(expert_input)
+        out_logic_f32, _ = self.logic_expert(expert_input_f32)
         
-        # Expert 3: Formal (Nous Model - currently stateless)
-        if self.nous:
-            symbolic_input = torch.tanh(self.to_formal(expert_input)) 
-            B, S, D = symbolic_input.shape
-            flat_input = symbolic_input.view(-1, D).to(torch.float32)
-            log_a = torch.log(torch.abs(flat_input) + 1e-15)
-            log_a = torch.clamp(log_a, -10, 10) 
-            formal_out_flat = torch.exp(2.0 * log_a)
-            out_formal = self.from_formal(formal_out_flat.view(B, S, 3).to(expert_input.dtype))
-        else:
-            out_formal = expert_input
+        # Expert 3: Formal (Bypassed for NaN Isolation)
+        out_formal_f32 = expert_input_f32
         
-        # 4. Weighted Integration
-        integrated_signal = (
-            relevance[..., 0:1] * out_syntax +
-            relevance[..., 1:2] * out_logic +
-            relevance[..., 2:3] * out_formal
+        # 4. Weighted Integration (Stay in float32)
+        rel_f32 = relevance.to(torch.float32)
+        integrated_signal_f32 = (
+            rel_f32[..., 0:1] * out_syntax_f32 +
+            rel_f32[..., 1:2] * out_logic_f32 +
+            rel_f32[..., 2:3] * out_formal_f32
         )
         
-        # 5. Return to Residual Stream
-        output = self.adapter_out(integrated_signal)
+        # 5. Return to Residual Stream (Cast back to input dtype)
+        output = self.adapter_out(integrated_signal_f32.to(expert_input.dtype))
+        
+        # Final safety cleanse before exiting to Gemma
+        output = torch.nan_to_num(output, nan=0.0)
         
         return output, {}

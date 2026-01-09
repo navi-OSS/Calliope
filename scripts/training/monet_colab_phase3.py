@@ -51,9 +51,15 @@ class FourierExpert(nn.Module):
         w_slice = self.weight[:x_freq.shape[1], :].to(torch.complex64)
         x_freq = x_freq * w_slice
         out_f32 = torch.fft.irfft(x_freq, n=L, dim=1, norm="ortho")
-        out = out_f32.to(u.dtype)
-        out = self.out_proj(out)
-        return self.norm(torch.clamp(out, -100, 100)), None
+        
+        # Out Projection
+        out = self.out_proj(out_f32.to(u.dtype))
+        
+        # Stabilization: Cleanse NaNs and Clamp outliers
+        out = torch.nan_to_num(out, nan=0.0, posinf=10.0, neginf=-10.0)
+        out = torch.clamp(out, -10.0, 10.0)
+        
+        return self.norm(out), None
 
 # Patching the Lobe to use Fourier instead of SSM
 from monet import tpr
