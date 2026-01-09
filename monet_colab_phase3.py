@@ -108,8 +108,22 @@ def train_colab():
         try:
             snapshot_download(repo_id="thiliimanya/pruned_gemma_3_270m", local_dir=base_model_path)
         except Exception as e:
-            print(f"⚠️ Failed to download from HuggingFace: {e}")
-            print("Please upload 'model.safetensors' to ./pruned_gemma_3_270m/ manually if the repo assumes it exists.")
+            print(f"\n❌ CRITICAL ERROR: Could not download model weights.")
+            print(f"   Reason: {e}")
+            print("\n👉 ACTION REQUIRED:")
+            print("   The script cannot find the base model weights ('model.safetensors').")
+            print("   Since the repository 'thiliimanya/pruned_gemma_3_270m' might not be public/exist:")
+            print("   1. Open the file browser on the left.")
+            print("   2. Navigate to 'pruned_gemma_3_270m' folder.")
+            print("   3. Drag and Drop your LOCAL 'model.safetensors' (511MB) into that folder.")
+            print("   4. Re-run this cell.")
+            sys.exit(1)
+
+    # Double check before loading to prevent ugly Traceback
+    if not (os.path.exists(os.path.join(base_model_path, "model.safetensors")) or 
+            os.path.exists(os.path.join(base_model_path, "pytorch_model.bin"))):
+        print("❌ Error: Directory exists but weights are still missing. Did you upload them?")
+        sys.exit(1)
 
     base_model = AutoModelForCausalLM.from_pretrained(base_model_path, torch_dtype=torch.float16)
     tokenizer = PrunedTokenizer(base_model_path)
